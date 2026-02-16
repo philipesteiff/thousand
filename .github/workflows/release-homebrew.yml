@@ -1,0 +1,187 @@
+name: Release Homebrew Formula
+
+on:
+  push:
+    tags:
+      - "v*.*.*"
+
+permissions:
+  contents: write
+
+env:
+  BINARY_NAME: thousand
+  FORMULA_NAME: thousand
+  TAP_REPO: philipesteiff/homebrew-tap
+  TAP_BRANCH: main
+
+jobs:
+  verify:
+    runs-on: ubuntu-22.04
+    steps:
+      - name: Checkout repo
+        uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+
+      - name: Install Rust toolchain
+        uses: dtolnay/rust-toolchain@stable
+
+      - name: Format check
+        run: cargo fmt --check
+
+      - name: Clippy
+        run: cargo clippy --all-targets --all-features -- -D warnings
+
+      - name: Test
+        run: cargo test
+
+  build-artifacts:
+    needs: verify
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - runs_on: macos-14
+            os_name: darwin
+            arch_name: arm64
+          - runs_on: macos-13
+            os_name: darwin
+            arch_name: x86_64
+          - runs_on: ubuntu-22.04
+            os_name: linux
+            arch_name: x86_64
+    runs-on: ${{ matrix.runs_on }}
+    steps:
+      - name: Checkout repo
+        uses: actions/checkout@v4
+
+      - name: Install Rust toolchain
+        uses: dtolnay/rust-toolchain@stable
+
+      - name: Package release artifact
+        env:
+          TARGET_OS: ${{ matrix.os_name }}
+          TARGET_ARCH: ${{ matrix.arch_name }}
+        run: bash scripts/package.sh
+
+      - name: Upload release artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: thousand-${{ matrix.os_name }}-${{ matrix.arch_name }}
+          path: dist/thousand-${{ matrix.os_name }}-${{ matrix.arch_name }}.tar.gz
+          if-no-files-found: error
+
+  release-homebrew:
+    needs: build-artifacts
+    runs-on: ubuntu-22.04
+    steps:
+      - name: Checkout repo
+        uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+
+      - name: Download release artifacts
+        uses: actions/download-artifact@v4
+        with:
+          pattern: thousand-*
+          merge-multiple: true
+          path: dist
+
+      - name: Verify expected release artifacts
+        run: |
+          for asset in \
+            thousand-darwin-arm64.tar.gz \
+            thousand-darwin-x86_64.tar.gz \
+            thousand-linux-x86_64.tar.gz; do
+            if [ ! -f "dist/${asset}" ]; then
+              echo "Missing dist/${asset}" >&2
+              ls -la dist
+              exit 1
+            fi
+          done
+
+      - name: Compute checksums
+        run: |
+          TAG="${GITHUB_REF_NAME}"
+          VERSION="${TAG#v}"
+          DARWIN_ARM64_SHA="$(shasum -a 256 dist/thousand-darwin-arm64.tar.gz | awk '{print $1}')"
+          DARWIN_X86_64_SHA="$(shasum -a 256 dist/thousand-darwin-x86_64.tar.gz | awk '{print $1}')"
+          LINUX_X86_64_SHA="$(shasum -a 256 dist/thousand-linux-x86_64.tar.gz | awk '{print $1}')"
+
+          echo "TAG=${TAG}" >> "${GITHUB_ENV}"
+          echo "VERSION=${VERSION}" >> "${GITHUB_ENV}"
+          echo "DARWIN_ARM64_SHA=${DARWIN_ARM64_SHA}" >> "${GITHUB_ENV}"
+          echo "DARWIN_X86_64_SHA=${DARWIN_X86_64_SHA}" >> "${GITHUB_ENV}"
+          echo "LINUX_X86_64_SHA=${LINUX_X86_64_SHA}" >> "${GITHUB_ENV}"
+
+      - name: Create GitHub release
+        uses: softprops/action-gh-release@v2
+        with:
+          files: |
+            dist/thousand-darwin-arm64.tar.gz
+            dist/thousand-darwin-x86_64.tar.gz
+            dist/thousand-linux-x86_64.tar.gz
+
+      - name: Checkout Homebrew tap
+        uses: actions/checkout@v4
+        with:
+          repository: ${{ env.TAP_REPO }}
+          ref: ${{ env.TAP_BRANCH }}
+          path: homebrew-tap
+          token: ${{ secrets.HOMEBREW_TAP_TOKEN }}
+
+      - name: Update Homebrew formula
+        working-directory: homebrew-tap
+        run: |
+          FORMULA_DIR="Formula"
+          FORMULA_PATH="${FORMULA_DIR}/${FORMULA_NAME}.rb"
+          REPO_SLUG="${GITHUB_REPOSITORY}"
+
+          DARWIN_ARM64_URL="https://github.com/${REPO_SLUG}/releases/download/${TAG}/thousand-darwin-arm64.tar.gz"
+          DARWIN_X86_64_URL="https://github.com/${REPO_SLUG}/releases/download/${TAG}/thousand-darwin-x86_64.tar.gz"
+          LINUX_X86_64_URL="https://github.com/${REPO_SLUG}/releases/download/${TAG}/thousand-linux-x86_64.tar.gz"
+
+          mkdir -p "${FORMULA_DIR}"
+          cat <<RUBY | sed 's/^  //' > "${FORMULA_PATH}"
+            class Thousand < Formula
+              desc "Autonomous repository improvement orchestrator"
+              homepage "https://github.com/${REPO_SLUG}"
+              version "${VERSION}"
+
+              on_macos do
+                if Hardware::CPU.arm?
+                  url "${DARWIN_ARM64_URL}"
+                  sha256 "${DARWIN_ARM64_SHA}"
+                else
+                  url "${DARWIN_X86_64_URL}"
+                  sha256 "${DARWIN_X86_64_SHA}"
+                end
+              end
+
+              on_linux do
+                url "${LINUX_X86_64_URL}"
+                sha256 "${LINUX_X86_64_SHA}"
+              end
+
+              def install
+                bin.install "${BINARY_NAME}"
+              end
+
+              test do
+                assert_match version.to_s, shell_output("#{bin}/thousand version")
+              end
+            end
+          RUBY
+
+      - name: Commit and push formula
+        working-directory: homebrew-tap
+        run: |
+          git config user.name "github-actions[bot]"
+          git config user.email "github-actions[bot]@users.noreply.github.com"
+          git add "Formula/${FORMULA_NAME}.rb"
+          if git diff --cached --quiet; then
+            echo "No changes to Formula/${FORMULA_NAME}.rb"
+            exit 0
+          fi
+          git commit -m "${FORMULA_NAME} ${TAG}"
+          git push origin "${TAP_BRANCH}"
