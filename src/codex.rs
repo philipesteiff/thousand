@@ -9,16 +9,7 @@ use crate::types::{Change, Finding};
 
 const FINDING_SCHEMA: &str = r#"{
   "type": "object",
-  "required": [
-    "title",
-    "severity",
-    "type",
-    "body",
-    "id",
-    "status",
-    "evidence_files",
-    "suggested_tests"
-  ],
+  "required": ["title", "severity", "type", "body", "impact", "recommendation", "next_step"],
   "properties": {
     "title": {"type": "string"},
     "severity": {"type": "string", "enum": ["critical", "high", "medium", "low"]},
@@ -36,10 +27,9 @@ const FINDING_SCHEMA: &str = r#"{
       ]
     },
     "body": {"type": "string"},
-    "id": {"type": ["string", "null"]},
-    "status": {"type": ["string", "null"]},
-    "evidence_files": {"type": ["array", "null"], "items": {"type": "string"}},
-    "suggested_tests": {"type": ["array", "null"], "items": {"type": "string"}}
+    "impact": {"type": "string"},
+    "recommendation": {"type": "string"},
+    "next_step": {"type": "string"}
   },
   "additionalProperties": false
 }
@@ -74,21 +64,32 @@ impl CodexRunner {
         }
     }
 
-    pub fn run_finding(&self, prompt: &str, model: &str) -> Result<Finding> {
-        let output = self.exec(prompt, FINDING_SCHEMA, model)?;
+    pub fn run_finding(
+        &self,
+        prompt: &str,
+        model: &str,
+        reasoning_effort: &str,
+    ) -> Result<Finding> {
+        let output = self.exec(prompt, FINDING_SCHEMA, model, reasoning_effort)?;
         let finding: Finding =
             serde_json::from_str(output.trim()).context("failed to parse finding json")?;
         Ok(finding)
     }
 
-    pub fn run_change(&self, prompt: &str, model: &str) -> Result<Change> {
-        let output = self.exec(prompt, CHANGE_SCHEMA, model)?;
+    pub fn run_change(&self, prompt: &str, model: &str, reasoning_effort: &str) -> Result<Change> {
+        let output = self.exec(prompt, CHANGE_SCHEMA, model, reasoning_effort)?;
         let change: Change =
             serde_json::from_str(output.trim()).context("failed to parse change json")?;
         Ok(change)
     }
 
-    fn exec(&self, prompt: &str, schema: &str, model: &str) -> Result<String> {
+    fn exec(
+        &self,
+        prompt: &str,
+        schema: &str,
+        model: &str,
+        reasoning_effort: &str,
+    ) -> Result<String> {
         let mut schema_file = NamedTempFile::new().context("failed to create schema temp file")?;
         schema_file
             .write_all(schema.as_bytes())
@@ -104,7 +105,7 @@ impl CodexRunner {
             .arg("--output-last-message")
             .arg(output_file.path())
             .arg("-c")
-            .arg("model_reasoning_effort=\"low\"")
+            .arg(reasoning_effort_override(reasoning_effort))
             .arg("--sandbox")
             .arg("read-only")
             .arg("--model")
@@ -125,5 +126,21 @@ impl CodexRunner {
         let output =
             fs::read_to_string(output_file.path()).context("failed to read codex output")?;
         Ok(output)
+    }
+}
+
+fn reasoning_effort_override(raw: &str) -> String {
+    let escaped = raw.replace('\\', "\\\\").replace('"', "\\\"");
+    format!("model_reasoning_effort=\"{}\"", escaped)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::reasoning_effort_override;
+
+    #[test]
+    fn when_reasoning_effort_contains_quotes_should_escape_for_codex_config_arg() {
+        let arg = reasoning_effort_override("high\"custom");
+        assert_eq!(arg, "model_reasoning_effort=\"high\\\"custom\"");
     }
 }

@@ -67,10 +67,9 @@ pub struct Finding {
     #[serde(rename = "type")]
     pub finding_type: FindingType,
     pub body: String,
-    pub id: Option<String>,
-    pub status: Option<String>,
-    pub evidence_files: Option<Vec<String>>,
-    pub suggested_tests: Option<Vec<String>>,
+    pub impact: String,
+    pub recommendation: String,
+    pub next_step: String,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]

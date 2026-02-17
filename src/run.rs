@@ -23,15 +23,20 @@ struct RepoContext {
 pub async fn find(config_path: &Path) -> Result<()> {
     let ctx = load_repo_context(config_path).await?;
 
-    eprintln!("Running scan agent...");
+    eprintln!("Running find agent...");
     let codex = CodexRunner::new();
-    let scan_prompt = build_scan_prompt(&ctx.repo_root, &ctx.config);
-    let finding = codex.run_finding(&scan_prompt, &ctx.config.agents.scan.model)?;
+    let find_prompt = build_find_prompt(&ctx.repo_root, &ctx.config);
+    let finding = codex.run_finding(
+        &find_prompt,
+        &ctx.config.agents.find.model,
+        ctx.config.find_reasoning_effort(),
+    )?;
+    validate_finding(&finding)?;
 
     eprintln!("Creating GitHub issue...");
     let issue_title = build_issue_title(&finding);
     let issue_body = build_issue_body(&finding);
-    let labels = ctx.config.issue_labels_with_required();
+    let labels = build_issue_labels(&ctx.config, &finding);
     let issue = ctx
         .gh
         .create_issue(&ctx.owner, &ctx.repo, &issue_title, &issue_body, &labels)
@@ -58,10 +63,14 @@ pub async fn solve(config_path: &Path, issue_ref: &str) -> Result<()> {
         );
     }
 
-    eprintln!("Running change agent...");
+    eprintln!("Running solve agent...");
     let codex = CodexRunner::new();
-    let change_prompt = build_change_prompt_from_issue(&ctx.repo_root, &issue);
-    let change = codex.run_change(&change_prompt, &ctx.config.agents.change.model)?;
+    let solve_prompt = build_solve_prompt_from_issue(&ctx.repo_root, &issue);
+    let change = codex.run_change(
+        &solve_prompt,
+        &ctx.config.agents.solve.model,
+        ctx.config.solve_reasoning_effort(),
+    )?;
     let change_summary = choose_change_summary(&change.summary, &issue.title);
 
     eprintln!("Applying patch...");
@@ -188,15 +197,15 @@ fn issue_has_label(issue: &IssueDetails, label: &str) -> bool {
         .any(|current| current.name.eq_ignore_ascii_case(label))
 }
 
-fn build_scan_prompt(repo_root: &Path, config: &WorkflowConfig) -> String {
+fn build_find_prompt(repo_root: &Path, config: &WorkflowConfig) -> String {
     format!(
-        "You are an autonomous code auditor.\n\nRepo: {}\n\nTask: {}\n\nReturn ONLY valid JSON that matches the provided schema. Do not include markdown fences or extra text.",
+        "You are an autonomous code auditor.\n\nRepo: {}\n\nTask: {}\n\nReturn ONE finding with concise actionable sections.\nRules:\n- body: short problem statement (1-3 paragraphs).\n- impact: concrete impact/risk in 1-3 bullets.\n- recommendation: concrete fix direction in 1-3 bullets.\n- next_step: immediate first implementation step (one short sentence or up to 3 bullets).\n- Avoid long background and repetition.\n\nReturn ONLY valid JSON that matches the provided schema. Do not include markdown fences or extra text.",
         repo_root.display(),
         config.query.prompt
     )
 }
 
-fn build_change_prompt_from_issue(repo_root: &Path, issue: &IssueDetails) -> String {
+fn build_solve_prompt_from_issue(repo_root: &Path, issue: &IssueDetails) -> String {
     let mut prompt = String::new();
     prompt.push_str("You are an autonomous code fixer.\n\n");
     prompt.push_str(&format!("Repo: {}\n", repo_root.display()));
@@ -226,11 +235,7 @@ fn build_change_prompt_from_issue(repo_root: &Path, issue: &IssueDetails) -> Str
 }
 
 fn build_issue_title(finding: &Finding) -> String {
-    if let Some(id) = &finding.id {
-        format!("{}: {}", id, finding.title)
-    } else {
-        finding.title.clone()
-    }
+    finding.title.clone()
 }
 
 fn build_issue_body(finding: &Finding) -> String {
@@ -244,47 +249,51 @@ fn build_issue_body(finding: &Finding) -> String {
         body.push('\n');
     }
 
-    body.push_str("\n## Metadata\n");
-    body.push_str(&format!("- Severity: `{}`\n", finding.severity));
-    body.push_str(&format!("- Type: `{}`\n", finding.finding_type));
+    body.push_str("\n## Impact\n\n");
+    body.push_str(finding.impact.trim());
+    body.push('\n');
 
-    if let Some(id) = finding
-        .id
-        .as_deref()
-        .map(str::trim)
-        .filter(|id| !id.is_empty())
-    {
-        body.push_str(&format!("- ID: `{}`\n", id));
-    }
-    if let Some(status) = finding
-        .status
-        .as_deref()
-        .map(str::trim)
-        .filter(|status| !status.is_empty())
-    {
-        body.push_str(&format!("- Status: `{}`\n", status));
-    }
-    if let Some(files) = finding
-        .evidence_files
-        .as_ref()
-        .filter(|files| !files.is_empty())
-    {
-        body.push_str("- Evidence files:\n");
-        for file in files {
-            body.push_str(&format!("  - `{}`\n", file));
-        }
-    }
-    if let Some(tests) = finding
-        .suggested_tests
-        .as_ref()
-        .filter(|tests| !tests.is_empty())
-    {
-        body.push_str("- Suggested tests:\n");
-        for test in tests {
-            body.push_str(&format!("  - `{}`\n", test));
-        }
-    }
+    body.push_str("\n## Recommendation\n\n");
+    body.push_str(finding.recommendation.trim());
+    body.push('\n');
+
+    body.push_str("\n## Next Step\n\n");
+    body.push_str(finding.next_step.trim());
+    body.push('\n');
+
     body
+}
+
+fn validate_finding(finding: &Finding) -> Result<()> {
+    validate_finding_field("title", &finding.title, 120)?;
+    validate_finding_field("body", &finding.body, 1200)?;
+    validate_finding_field("impact", &finding.impact, 800)?;
+    validate_finding_field("recommendation", &finding.recommendation, 800)?;
+    validate_finding_field("next_step", &finding.next_step, 400)?;
+    Ok(())
+}
+
+fn validate_finding_field(name: &str, value: &str, max_len: usize) -> Result<()> {
+    let trimmed = value.trim();
+    if trimmed.is_empty() {
+        bail!("finding.{} must be non-empty", name);
+    }
+    if trimmed.len() > max_len {
+        bail!("finding.{} exceeds {} characters", name, max_len);
+    }
+    Ok(())
+}
+
+fn build_issue_labels(config: &WorkflowConfig, finding: &Finding) -> Vec<String> {
+    let mut labels = config.issue_labels_with_required();
+    upsert_label(&mut labels, format!("severity:{}", finding.severity));
+    upsert_label(&mut labels, format!("type:{}", finding.finding_type));
+    labels
+}
+
+fn upsert_label(labels: &mut Vec<String>, label: String) {
+    labels.retain(|existing| !existing.eq_ignore_ascii_case(&label));
+    labels.push(label);
 }
 
 fn build_pr_body(issue_number: u64, change_summary: &str, change: &Change) -> String {
@@ -370,10 +379,10 @@ mod tests {
             severity: Severity::Low,
             finding_type: FindingType::Documentation,
             body: "Add a verification step after installation.".to_string(),
-            id: Some("DOC-1".to_string()),
-            status: Some("open".to_string()),
-            evidence_files: Some(vec!["README.md:24".to_string()]),
-            suggested_tests: Some(vec!["skill --version".to_string()]),
+            impact: "Users may have setup confusion after install.".to_string(),
+            recommendation: "Document a quick verification command after installation.".to_string(),
+            next_step: "Add one verification snippet under each install method in README."
+                .to_string(),
         }
     }
 
@@ -387,6 +396,10 @@ mod tests {
                 name: "thousand".to_string(),
             }],
         }
+    }
+
+    fn sample_workflow_config(yaml: &str) -> WorkflowConfig {
+        serde_yaml::from_str(yaml).expect("config")
     }
 
     #[test]
@@ -411,18 +424,98 @@ mod tests {
     }
 
     #[test]
-    fn when_building_issue_body_should_include_metadata_and_optional_fields() {
+    fn when_building_issue_body_should_include_structured_sections() {
         let finding = sample_finding();
         let body = build_issue_body(&finding);
 
         assert!(body.contains("## Finding"));
-        assert!(body.contains("## Metadata"));
-        assert!(body.contains("- Severity: `low`"));
-        assert!(body.contains("- Type: `documentation`"));
-        assert!(body.contains("- ID: `DOC-1`"));
-        assert!(body.contains("- Status: `open`"));
-        assert!(body.contains("- Evidence files:"));
-        assert!(body.contains("- Suggested tests:"));
+        assert!(body.contains("## Impact"));
+        assert!(body.contains("## Recommendation"));
+        assert!(body.contains("## Next Step"));
+        assert!(!body.contains("## Metadata"));
+    }
+
+    #[test]
+    fn when_building_issue_labels_should_include_severity_and_type() {
+        let cfg = sample_workflow_config(
+            r#"
+version: 1
+name: test
+query:
+  prompt: audit
+agents:
+  find:
+    model: gpt-5-codex
+  solve:
+    model: gpt-5-codex
+outputs:
+  github:
+    repo: owner/repo
+"#,
+        );
+        let labels = build_issue_labels(&cfg, &sample_finding());
+        assert!(labels.iter().any(|label| label == "thousand"));
+        assert!(labels.iter().any(|label| label == "severity:low"));
+        assert!(labels.iter().any(|label| label == "type:documentation"));
+    }
+
+    #[test]
+    fn when_building_issue_labels_should_dedupe_case_insensitive() {
+        let cfg = sample_workflow_config(
+            r#"
+version: 1
+name: test
+query:
+  prompt: audit
+agents:
+  find:
+    model: gpt-5-codex
+  solve:
+    model: gpt-5-codex
+outputs:
+  github:
+    repo: owner/repo
+    issue:
+      labels: ["Severity:Low", "Type:documentation", "ops"]
+"#,
+        );
+        let labels = build_issue_labels(&cfg, &sample_finding());
+        assert!(labels.iter().any(|label| label == "thousand"));
+        assert!(labels.iter().any(|label| label == "severity:low"));
+        assert!(labels.iter().any(|label| label == "type:documentation"));
+        assert!(labels.iter().any(|label| label == "ops"));
+        assert_eq!(
+            labels
+                .iter()
+                .filter(|label| label.eq_ignore_ascii_case("severity:low"))
+                .count(),
+            1
+        );
+        assert_eq!(
+            labels
+                .iter()
+                .filter(|label| label.eq_ignore_ascii_case("type:documentation"))
+                .count(),
+            1
+        );
+    }
+
+    #[test]
+    fn when_finding_required_field_is_empty_should_fail_validation() {
+        let mut finding = sample_finding();
+        finding.impact = "  ".to_string();
+        let err = validate_finding(&finding).expect_err("expected validation error");
+        assert!(err.to_string().contains("finding.impact must be non-empty"));
+    }
+
+    #[test]
+    fn when_finding_field_is_too_long_should_fail_validation() {
+        let mut finding = sample_finding();
+        finding.next_step = "a".repeat(401);
+        let err = validate_finding(&finding).expect_err("expected validation error");
+        assert!(err
+            .to_string()
+            .contains("finding.next_step exceeds 400 characters"));
     }
 
     #[test]
