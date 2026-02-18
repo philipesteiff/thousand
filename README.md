@@ -85,12 +85,27 @@ Classification is encoded as issue labels (`severity:*` and `type:*`) instead of
 
 ## Release (Maintainers)
 Tagged releases (`v*.*.*`) trigger `.github/workflows/release-homebrew.yml`:
-1. Runs `fmt`, `clippy`, and `test`.
+1. Runs `just lint` and `just test` on both `ubuntu-22.04` and `macos-14`.
 2. Builds and publishes:
    - `thousand-darwin-arm64.tar.gz`
    - `thousand-darwin-x86_64.tar.gz`
    - `thousand-linux-x86_64.tar.gz`
-3. Updates `Formula/thousand.rb` in `philipesteiff/homebrew-tap` using `HOMEBREW_TAP_TOKEN`.
+3. (Optional strict mode) validates pushed tag matches `Cargo.toml` version when repo variable `STRICT_RELEASE=true`.
+4. Updates `Formula/thousand.rb` via `scripts/update_homebrew_formula.sh`.
+   - CI uses `TAP_DIR=homebrew-tap` after checking out `philipesteiff/homebrew-tap`.
+   - Formula uses Homebrew platform/arch blocks (`on_macos`, `on_linux`, `on_arm`, `on_intel`) for per-platform assets.
+   - Local default is `TAP_DIR=/Users/philipesteiff/Projects/homebrew-tap`.
+5. Audits the generated formula with `brew audit --strict`.
+
+Local formula update:
+```bash
+VERSION=0.1.0 TAG=v0.1.0 REPO_SLUG=philipesteiff/thousand just update-homebrew-formula
+test -f /Users/philipesteiff/Projects/homebrew-tap/Formula/thousand.rb
+```
+If `dist/` is missing any release archive, pass the missing checksum(s) explicitly:
+```bash
+DARWIN_X86_64_SHA=<sha256> just update-homebrew-formula
+```
 
 CI checks run on every push commit and PR update via `.github/workflows/ci.yml` using:
 - `just lint`

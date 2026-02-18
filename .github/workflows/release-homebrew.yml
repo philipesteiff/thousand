@@ -11,12 +11,20 @@ permissions:
 env:
   BINARY_NAME: thousand
   FORMULA_NAME: thousand
+  STRICT_RELEASE: ${{ vars.STRICT_RELEASE }}
+  TAP_NAME: philipesteiff/tap
   TAP_REPO: philipesteiff/homebrew-tap
   TAP_BRANCH: main
 
 jobs:
   verify:
-    runs-on: ubuntu-22.04
+    strategy:
+      fail-fast: false
+      matrix:
+        runs_on:
+          - ubuntu-22.04
+          - macos-14
+    runs-on: ${{ matrix.runs_on }}
     steps:
       - name: Checkout repo
         uses: actions/checkout@v4
@@ -26,14 +34,14 @@ jobs:
       - name: Install Rust toolchain
         uses: dtolnay/rust-toolchain@stable
 
-      - name: Format check
-        run: cargo fmt --check
+      - name: Install just
+        uses: taiki-e/install-action@just
 
-      - name: Clippy
-        run: cargo clippy --all-targets --all-features -- -D warnings
+      - name: Lint
+        run: just lint
 
       - name: Test
-        run: cargo test
+        run: just test
 
   build-artifacts:
     needs: verify
@@ -44,7 +52,7 @@ jobs:
           - runs_on: macos-14
             os_name: darwin
             arch_name: arm64
-          - runs_on: macos-13
+          - runs_on: macos-15-intel
             os_name: darwin
             arch_name: x86_64
           - runs_on: ubuntu-22.04
@@ -73,12 +81,22 @@ jobs:
 
   release-homebrew:
     needs: build-artifacts
-    runs-on: ubuntu-22.04
+    runs-on: macos-14
     steps:
       - name: Checkout repo
         uses: actions/checkout@v4
         with:
           fetch-depth: 0
+
+      - name: Verify tag matches Cargo.toml version (strict)
+        if: env.STRICT_RELEASE == 'true'
+        run: |
+          TAG="${GITHUB_REF_NAME}"
+          VERSION_TOML=$(sed -n 's/^version = "\(.*\)"/\1/p' Cargo.toml | head -n1)
+          if [ "v${VERSION_TOML}" != "${TAG}" ]; then
+            echo "Tag ${TAG} does not match Cargo.toml version v${VERSION_TOML}" >&2
+            exit 1
+          fi
 
       - name: Download release artifacts
         uses: actions/download-artifact@v4
@@ -131,47 +149,21 @@ jobs:
           token: ${{ secrets.HOMEBREW_TAP_TOKEN }}
 
       - name: Update Homebrew formula
-        working-directory: homebrew-tap
+        env:
+          TAP_DIR: homebrew-tap
+          REPO_SLUG: ${{ github.repository }}
         run: |
-          FORMULA_DIR="Formula"
-          FORMULA_PATH="${FORMULA_DIR}/${FORMULA_NAME}.rb"
-          REPO_SLUG="${GITHUB_REPOSITORY}"
+          bash scripts/update_homebrew_formula.sh
 
-          DARWIN_ARM64_URL="https://github.com/${REPO_SLUG}/releases/download/${TAG}/thousand-darwin-arm64.tar.gz"
-          DARWIN_X86_64_URL="https://github.com/${REPO_SLUG}/releases/download/${TAG}/thousand-darwin-x86_64.tar.gz"
-          LINUX_X86_64_URL="https://github.com/${REPO_SLUG}/releases/download/${TAG}/thousand-linux-x86_64.tar.gz"
-
-          mkdir -p "${FORMULA_DIR}"
-          cat <<RUBY | sed 's/^  //' > "${FORMULA_PATH}"
-            class Thousand < Formula
-              desc "Autonomous repository improvement orchestrator"
-              homepage "https://github.com/${REPO_SLUG}"
-              version "${VERSION}"
-
-              on_macos do
-                if Hardware::CPU.arm?
-                  url "${DARWIN_ARM64_URL}"
-                  sha256 "${DARWIN_ARM64_SHA}"
-                else
-                  url "${DARWIN_X86_64_URL}"
-                  sha256 "${DARWIN_X86_64_SHA}"
-                end
-              end
-
-              on_linux do
-                url "${LINUX_X86_64_URL}"
-                sha256 "${LINUX_X86_64_SHA}"
-              end
-
-              def install
-                bin.install "${BINARY_NAME}"
-              end
-
-              test do
-                assert_match version.to_s, shell_output("#{bin}/thousand version")
-              end
-            end
-          RUBY
+      - name: Audit Homebrew formula
+        env:
+          HOMEBREW_NO_AUTO_UPDATE: 1
+        run: |
+          BREW_TAP_DIR="$(brew --repository)/Library/Taps/${TAP_REPO}"
+          mkdir -p "$(dirname "${BREW_TAP_DIR}")"
+          rm -rf "${BREW_TAP_DIR}"
+          ln -s "${GITHUB_WORKSPACE}/homebrew-tap" "${BREW_TAP_DIR}"
+          brew audit --strict --formula "${TAP_NAME}/${FORMULA_NAME}"
 
       - name: Commit and push formula
         working-directory: homebrew-tap

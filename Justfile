@@ -30,3 +30,7 @@ lint:
 # Build and package a release archive for the current host.
 package:
   bash scripts/package.sh
+
+# Update Formula/thousand.rb in the local Homebrew tap.
+update-homebrew-formula:
+  bash scripts/update_homebrew_formula.sh
