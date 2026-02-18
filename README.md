@@ -8,7 +8,31 @@
 ## Prerequisites
 - `codex` CLI installed on `PATH`
 - `git` configured with `origin` in the target repo
-- `THOUSAND_GH_TOKEN` (fallback: `GITHUB_TOKEN`)
+- GitHub API token: `THOUSAND_GH_TOKEN` (fallback: `GITHUB_TOKEN`)
+- CI Codex auth: `CODEX_API_KEY` (recommended for non-interactive/headless runs)
+
+## Auth Modes
+- Local interactive auth: use `codex login`; `thousand` will use the existing Codex login session.
+- CI/headless auth: set `CODEX_API_KEY`; `thousand` runs `codex exec` and inherits the process environment.
+- `thousand` does not override Codex auth mode; it relies on Codex CLI authentication behavior.
+
+## CI Example (API Key + GitHub Token)
+```yaml
+jobs:
+  thousand:
+    runs-on: ubuntu-22.04
+    steps:
+      - uses: actions/checkout@v4
+      - name: Run thousand
+        env:
+          CODEX_API_KEY: ${{ secrets.CODEX_API_KEY }}
+          THOUSAND_GH_TOKEN: ${{ secrets.THOUSAND_GH_TOKEN }}
+        run: |
+          thousand validate --config .thousand/workflow.yaml
+          thousand find --config .thousand/workflow.yaml
+          # after selecting an issue to implement:
+          thousand solve --config .thousand/workflow.yaml --issue 7
+```
 
 ## Install
 Homebrew (macOS + Linuxbrew x86_64):
